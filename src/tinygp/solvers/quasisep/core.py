@@ -197,6 +197,9 @@ class StrictLowerTriQSM(QSM):
     @jax.jit
     @handle_matvec_shapes
     def matmul(self, x: JAXArray) -> JAXArray:
+        if jax.default_backend() in ["gpu", "tpu"]:
+            return self.parallel_matmul(x)
+
         def impl(f, data):  # type: ignore
             q, a, x = data
             return a @ f + jnp.outer(q, x), f
@@ -281,6 +284,9 @@ class StrictUpperTriQSM(QSM):
     @jax.jit
     @handle_matvec_shapes
     def matmul(self, x: JAXArray) -> JAXArray:
+        if jax.default_backend() in ["gpu", "tpu"]:
+            return self.parallel_matmul(x)
+
         def impl(f, data):  # type: ignore
             p, a, x = data
             return a.T @ f + jnp.outer(p, x), f
@@ -351,6 +357,27 @@ class LowerTriQSM(QSM):
 
     @jax.jit
     @handle_matvec_shapes
+    def parallel_solve(self, y: JAXArray) -> JAXArray:
+        d = self.diag.d
+        p, q, a = self.lower.p, self.lower.q, self.lower.a
+
+        A_prime = a - (q / d[:, None])[:, :, None] * p[:, None, :]
+        u_prime = (q / d[:, None])[:, :, None] * y[:, None, :]
+
+        def impl(sm, sn):
+            return (sn[0] @ sm[0], sn[0] @ sm[1] + sn[1])
+
+        states = (A_prime, u_prime)
+        f = jax.lax.associative_scan(impl, states)[1]
+
+        f_shifted = jnp.concatenate((jnp.zeros_like(f[:1]), f[:-1]), axis=0)
+
+        pf = jax.vmap(lambda p_i, f_i: p_i @ f_i)(p, f_shifted)
+        x = (y - pf) / d[:, None]
+        return x
+
+    @jax.jit
+    @handle_matvec_shapes
     def solve(self, y: JAXArray) -> JAXArray:
         """Solve a linear system with this matrix
 
@@ -361,6 +388,8 @@ class LowerTriQSM(QSM):
             y (n, ...): A matrix or vector with leading dimension matching this
                 matrix.
         """
+        if jax.default_backend() in ["gpu", "tpu"]:
+            return self.parallel_solve(y)
 
         def impl(fn, data):  # type: ignore
             ((cn,), (pn, wn, an)), yn = data
@@ -405,6 +434,28 @@ class UpperTriQSM(QSM):
 
     @jax.jit
     @handle_matvec_shapes
+    def parallel_solve(self, y: JAXArray) -> JAXArray:
+        d = self.diag.d
+        p, q, a = self.upper.p, self.upper.q, self.upper.a
+
+        at = jnp.swapaxes(a, 1, 2)
+        A_prime = at - (p / d[:, None])[:, :, None] * q[:, None, :]
+        u_prime = (p / d[:, None])[:, :, None] * y[:, None, :]
+
+        def impl(sm, sn):
+            return (sn[0] @ sm[0], sn[0] @ sm[1] + sn[1])
+
+        states = (A_prime, u_prime)
+        f = jax.lax.associative_scan(impl, states, reverse=True)[1]
+
+        f_shifted = jnp.concatenate((f[1:], jnp.zeros_like(f[:1])), axis=0)
+
+        qf = jax.vmap(lambda q_i, f_i: q_i @ f_i)(q, f_shifted)
+        x = (y - qf) / d[:, None]
+        return x
+
+    @jax.jit
+    @handle_matvec_shapes
     def solve(self, y: JAXArray) -> JAXArray:
         """Solve a linear system with this matrix
 
@@ -415,6 +466,8 @@ class UpperTriQSM(QSM):
             y (n, ...): A matrix or vector with leading dimension matching this
                 matrix.
         """
+        if jax.default_backend() in ["gpu", "tpu"]:
+            return self.parallel_solve(y)
 
         def impl(fn, data):  # type: ignore
             ((cn,), (pn, wn, an)), yn = data
@@ -518,7 +571,7 @@ class SquareQSM(QSM):
 
         init = jnp.zeros_like(jnp.outer(h[-1], p[-1]))
         args = (ig, p, a, h, b, s, v)
-        lam, t, u = jax.lax.scan(backward, init, args, reverse=True)[1]
+        lam, t, u = jax.lax.scan(backward, init, (ig, p, a, h, b, s, v), reverse=True)[1]
         return SquareQSM(
             diag=DiagQSM(d=lam),
             lower=StrictLowerTriQSM(p=t, q=s, a=ell),
